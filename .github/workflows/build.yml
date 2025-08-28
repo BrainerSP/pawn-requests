@@ -1,0 +1,139 @@
+name: Build for debian 11
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["*", "*/*", "**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["*", "*/*", "**"]
+
+permissions:
+  contents: write  # required for creating a release
+
+env:
+  PLUGIN_VERSION: 1.0.0
+
+jobs:
+  build-linux-release:
+    runs-on: ubuntu-latest
+    container: debian:11
+    steps:
+      - name: Install dependencies (i386 toolchain + libcurl/openssl) and Python
+        run: |
+          set -eux
+          dpkg --add-architecture i386
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git gnupg curl zip unzip tar file pkg-config \
+            build-essential g++ gcc g++-multilib libc6-dev-i386 \
+            ninja-build patchelf python3 python3-pip \
+            zlib1g-dev:i386 libcurl4-openssl-dev:i386
+          update-ca-certificates
+          export HOME=/root
+          export CONAN_USER_HOME="$HOME"
+          mkdir -p "$HOME" "$HOME/.conan/profiles"
+          pip3 install --upgrade "cmake>=3.25,<3.26" "conan<2"
+          cmake --version
+          conan --version
+          conan profile new default --detect --force
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+          printf "\n# Force policy minimum for old recipes\nconf.tools.cmake.cmaketoolchain:cache_variables=['CMAKE_POLICY_VERSION_MINIMUM=3.5']\n" >> "$HOME/.conan/profiles/default"
+          conan profile show default
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure (CMake, i386)
+        env:
+          CC: gcc
+          CXX: g++
+          HOME: /root
+          CONAN_USER_HOME: /root
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-m32" \
+            -DCMAKE_CXX_FLAGS="-m32" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-m32"
+
+      - name: Build
+        env:
+          HOME: /root
+          CONAN_USER_HOME: /root
+        run: |
+          set -eux
+          cmake --build build -j
+
+      - name: Collect plugin .so
+        id: bin
+        run: |
+          set -eux
+          so_path="$(find build -type f -name '*.so' | head -n1 || true)"
+          test -n "$so_path" || (echo "No .so produced" >&2; exit 1)
+          echo "so_path=$so_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (Linux i386)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pawn-requests-${{ env.PLUGIN_VERSION }}-debian-11-i386
+          path: ${{ steps.bin.outputs.so_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release (on tag)
+    needs: [build-linux-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+
+      - name: Prepare includes archive
+        run: |
+          set -eux
+          TAG="${GITHUB_REF_NAME}"
+          OUTDIR="includes_pkg"
+          mkdir -p "${OUTDIR}"
+          for f in requests.inc status_codes.inc http_methods.inc pawn_requests_version.inc; do
+            if [ -f "$f" ]; then cp -f "$f" "${OUTDIR}/"; fi
+            if [ -f "src/$f" ]; then cp -f "src/$f" "${OUTDIR}/"; fi
+            if [ -f "include/$f" ]; then cp -f "include/$f" "${OUTDIR}/"; fi
+          done
+          test -f "${OUTDIR}/requests.inc" || (echo "requests.inc not found" >&2; exit 1)
+          test -f "${OUTDIR}/status_codes.inc" || (echo "status_codes.inc not found" >&2; exit 1)
+          test -f "${OUTDIR}/http_methods.inc" || (echo "http_methods.inc not found" >&2; exit 1)
+          test -f "${OUTDIR}/pawn_requests_version.inc" || (echo "pawn_requests_version.inc not found" >&2; exit 1)
+          ZIPNAME="pawn-requests-includes-${TAG}.zip"
+          (cd "${OUTDIR}" && zip -9 -r "../${ZIPNAME}" .)
+          echo "zip_path=${ZIPNAME}" >> "$GITHUB_OUTPUT"
+
+      - name: List artifacts (debug)
+        run: |
+          set -eux
+          find ./dist -type f -maxdepth 3 -print
+          ls -l pawn-requests-includes-*.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/pawn-requests-*/**/*.so
+            pawn-requests-includes-${{ github.ref_name }}.zip
